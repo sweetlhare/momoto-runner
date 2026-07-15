@@ -8,10 +8,10 @@ workstation, or a rented box) instead of ours. The runner connects **outbound** 
 
 | task | backend | licence |
 |------|---------|---------|
-| detection | D-FINE | Apache-2.0 |
+| detection | RF-DETR (primary) · D-FINE | Apache-2.0 |
 | segmentation | D-FINE-seg | Apache-2.0 |
-| keypoints / pose | DETRPose | Apache-2.0 |
-| classification | ConvNeXtV2 (timm) | MIT/Apache |
+| keypoints / pose | DETRPose · RF-DETR Pose | Apache-2.0 |
+| classification | ConvNeXtV2 · MobileNetV4 · EfficientViT (timm) | MIT/Apache |
 
 The image is **self-contained**: it bundles the model repos + a shared venv (Python 3.12 /
 torch 2.11 cu130 for D-FINE / DETRPose / ConvNeXtV2) and D-FINE-seg's own uv-locked env
@@ -75,7 +75,7 @@ platform  ──queue──►  BackgroundJob(job_type=agent_train, status=queue
 ## Status
 
 Verified end-to-end on a real GPU: the protocol (queue / claim / progress / result / cancel),
-training (all four backends), inference, auto-label, and ONNX export all run through the runner.
+training (all backends), inference, auto-label, and ONNX export all run through the runner.
 A cooperative **Stop** kills the training child and the runner keeps serving (it does not crash).
 Weights + exported ONNX land in your S3; the platform's deploy/microservice export pulls that
 ONNX back to bundle a permissive (onnxruntime) deployable artifact.
