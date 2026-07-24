@@ -254,7 +254,15 @@ def run_task(task):
             if cfg_s3:
                 prefix = (cfg_s3.get("path_prefix").strip("/") + "/") if cfg_s3.get("path_prefix") else ""
                 weights_key = f"{unique}/models/agent/{os.path.basename(res.weights)}"
-                _s3_client(cfg_s3).upload_file(res.weights, cfg_s3["bucket"], f"{prefix}{weights_key}")
+                try:
+                    _s3_client(cfg_s3).upload_file(res.weights, cfg_s3["bucket"], f"{prefix}{weights_key}")
+                except Exception as e:
+                    # Write-side mirror of the image-download fallback: the platform's S3 endpoint is
+                    # not always reachable from the agent's network. Stream the checkpoint to the
+                    # platform instead — it stores it and returns the server-derived key. Losing the
+                    # weights of a finished run to a network detail is the worst possible outcome.
+                    print(f"[agent] weights S3 upload failed ({e}); streaming to the platform", flush=True)
+                    weights_key = upload_weights(job_key, res.weights)
             else:
                 weights_key = upload_weights(job_key, res.weights)
 
@@ -468,9 +476,19 @@ def run_export(task):
         post_progress({"stage": "Uploading ONNX", "progress": 80})
 
         onnx_key = None
-        if s3 and os.path.exists(out_onnx):
-            onnx_key = os.path.splitext(weights_key)[0] + ".onnx"
-            s3.upload_file(out_onnx, bucket, f"{prefix}{onnx_key}")
+        if os.path.exists(out_onnx):
+            if s3:
+                onnx_key = os.path.splitext(weights_key)[0] + ".onnx"
+                try:
+                    s3.upload_file(out_onnx, bucket, f"{prefix}{onnx_key}")
+                except Exception as e:
+                    print(f"[agent] ONNX S3 upload failed ({e}); streaming to the platform", flush=True)
+                    onnx_key = upload_weights(job_key, out_onnx)
+            else:
+                # No BYO S3 (community / local storage). The weights endpoint places an export job's
+                # upload next to the model's existing weights, so the ONNX is durable there too —
+                # without this the export "succeeded" while storing nothing.
+                onnx_key = upload_weights(job_key, out_onnx)
 
         api("POST", f"/agent/tasks/{job_key}/result", json={
             "ok": True, "onnx": onnx_key, "fmt": payload.get("task"),
