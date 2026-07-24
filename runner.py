@@ -169,8 +169,13 @@ def build_samples(job_key, payload, work):
                 try:
                     s3.download_file(bucket, f"{prefix}{key}", local)
                 except Exception as e:
-                    print(f"[agent] skip {fn}: {e}", flush=True)
-                    continue
+                    # The platform's S3 endpoint isn't always reachable from the agent's network (a
+                    # host-local published port, a private VPC, a proxy that breaks SigV4). Fall back
+                    # to the media API we're already authenticated against — it follows the 302 to a
+                    # presigned URL for BYO-S3 users, so it covers both storage modes.
+                    if not download_media(key, local):
+                        print(f"[agent] skip {fn}: {e}", flush=True)
+                        continue
             elif not download_media(key, local):
                 # No BYO S3 → platform stores images locally; fetch via the authenticated media API.
                 print(f"[agent] skip {fn}: media fetch failed", flush=True)
@@ -364,8 +369,10 @@ def run_infer(task):
                     try:
                         s3.download_file(bucket, f"{prefix}{key}", local)
                     except Exception as e:
-                        print(f"[agent] infer skip {base}: {e}", flush=True)
-                        continue
+                        # Same S3-unreachable fallback as the training dataset build above.
+                        if not download_media(key, local):
+                            print(f"[agent] infer skip {base}: {e}", flush=True)
+                            continue
                 elif not download_media(key, local):
                     print(f"[agent] infer skip {base}: media fetch failed", flush=True)
                     continue
