@@ -305,12 +305,308 @@ def run_task(task):
         shutil.rmtree(work, ignore_errors=True)
 
 
+def _zeroshot_model():
+    """Load GroundingDINO once (HF transformers, on the GPU) and cache it. `base` by default — bigger
+    and more accurate than the browser's `tiny`, affordable on the agent's GPU. Env ZEROSHOT_MODEL
+    overrides (e.g. IDEA-Research/grounding-dino-tiny for a lighter download)."""
+    import torch
+    from transformers import AutoProcessor, AutoModelForZeroShotObjectDetection
+    model_id = os.environ.get("ZEROSHOT_MODEL", "IDEA-Research/grounding-dino-base")
+    if _ZS["model"] is None or _ZS["id"] != model_id:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        proc = AutoProcessor.from_pretrained(model_id)
+        model = AutoModelForZeroShotObjectDetection.from_pretrained(model_id).to(device).eval()
+        _ZS.update(model=model, proc=proc, id=model_id, device=device)
+        print(f"[agent] zero-shot model ready: {model_id} on {device}", flush=True)
+    return _ZS["model"], _ZS["proc"], _ZS["device"]
+
+
+def _zs_iou(a, b):
+    """IoU of two normalized xyxy boxes."""
+    ix1, iy1 = max(a[0], b[0]), max(a[1], b[1])
+    ix2, iy2 = min(a[2], b[2]), min(a[3], b[3])
+    iw, ih = max(0.0, ix2 - ix1), max(0.0, iy2 - iy1)
+    inter = iw * ih
+    ua = max(0.0, a[2] - a[0]) * max(0.0, a[3] - a[1])
+    ub = max(0.0, b[2] - b[0]) * max(0.0, b[3] - b[1])
+    uni = ua + ub - inter
+    return inter / uni if uni > 0 else 0.0
+
+
+def _zs_nms(objs, same_iou=0.5, cross_iou=0.55, max_keep=300):
+    """Greedy NMS over canonical cxcywh objects — open-vocab detectors emit many near-duplicate boxes
+    (and the same object fires under several prompts). Mirrors the browser's browserDetect nms()."""
+    def xyxy(o):
+        b = o["bbox"]
+        return (b["x_center"] - b["width"] / 2, b["y_center"] - b["height"] / 2,
+                b["x_center"] + b["width"] / 2, b["y_center"] + b["height"] / 2)
+    kept = []
+    for o in sorted(objs, key=lambda o: o.get("score") or 0.0, reverse=True):
+        if len(kept) >= max_keep:
+            break
+        ob = xyxy(o)
+        dup = False
+        for k in kept:
+            thr = same_iou if k["category"] == o["category"] else cross_iou
+            if _zs_iou(ob, xyxy(k)) > thr:
+                dup = True
+                break
+        if not dup:
+            kept.append(o)
+    return kept
+
+
+def _zeroshot_detect(model, proc, device, image_path, queries, box_th, text_th):
+    """Run GroundingDINO once per prompt (batch-1 text encoder, like the browser) so each box's
+    category is unambiguous; return canonical cxcywh objects, NMS-deduped."""
+    import torch
+    from PIL import Image
+    image = Image.open(image_path).convert("RGB")
+    W, H = image.size
+    objs = []
+    for category, prompt in queries:
+        inputs = proc(images=image, text=prompt, return_tensors="pt").to(device)
+        with torch.no_grad():
+            out = model(**inputs)
+        try:
+            res = proc.post_process_grounded_object_detection(
+                out, inputs.input_ids, threshold=box_th, text_threshold=text_th,
+                target_sizes=[(H, W)])[0]
+        except TypeError:   # older transformers used box_threshold=
+            res = proc.post_process_grounded_object_detection(
+                out, inputs.input_ids, box_threshold=box_th, text_threshold=text_th,
+                target_sizes=[(H, W)])[0]
+        for box, score in zip(res["boxes"].tolist(), res["scores"].tolist()):
+            x1, y1, x2, y2 = box
+            bw, bh = (x2 - x1) / W, (y2 - y1) / H
+            if bw <= 0 or bh <= 0:
+                continue
+            objs.append({"category": category, "score": float(score),
+                         "bbox": {"x_center": ((x1 + x2) / 2) / W, "y_center": ((y1 + y2) / 2) / H,
+                                  "width": bw, "height": bh}})
+    return _zs_nms(objs)
+
+
+# ── segmentation: GroundingDINO boxes → SAM masks → polygons (the old GroundedSAM, on the GPU) ──
+_SAM = {"model": None, "proc": None, "id": None, "device": "cpu"}
+
+
+def _sam_model():
+    """Load SAM once (HF transformers, on the GPU) and cache it. Box-prompted: each GroundingDINO box
+    becomes a SAM prompt → a mask we trace to a polygon. Env ZEROSHOT_SAM_MODEL overrides."""
+    import torch
+    from transformers import SamModel, SamProcessor
+    model_id = os.environ.get("ZEROSHOT_SAM_MODEL", "facebook/sam-vit-base")
+    if _SAM["model"] is None or _SAM["id"] != model_id:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        _SAM["proc"] = SamProcessor.from_pretrained(model_id)
+        _SAM["model"] = SamModel.from_pretrained(model_id).to(device).eval()
+        _SAM.update(id=model_id, device=device)
+        print(f"[agent] zero-shot SAM ready: {model_id} on {device}", flush=True)
+    return _SAM["model"], _SAM["proc"], _SAM["device"]
+
+
+def _mask_to_polygon(mask_uint8, W, H, eps_frac=0.004):
+    """Largest external contour of a binary mask → simplified, normalized flat polygon [x1,y1,...]
+    (the editor's polygon shape). Mirrors the browser's maskToPolygon."""
+    import cv2
+    cnts, _ = cv2.findContours(mask_uint8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not cnts:
+        return None
+    c = max(cnts, key=cv2.contourArea)
+    if cv2.contourArea(c) < 4:
+        return None
+    approx = cv2.approxPolyDP(c, eps_frac * cv2.arcLength(c, True), True).reshape(-1, 2)
+    if len(approx) < 3:
+        return None
+    flat = []
+    for x, y in approx:
+        flat.append(float(x) / W)
+        flat.append(float(y) / H)
+    return flat
+
+
+def _sam_segment(sam, sam_proc, device, image_path, objs):
+    """Add a normalized `polygon` to each detection by prompting SAM with its box. Boxes with no
+    usable mask keep just their box. All boxes go in one forward (batched prompts)."""
+    if not objs:
+        return objs
+    import torch
+    from PIL import Image
+    image = Image.open(image_path).convert("RGB")
+    W, H = image.size
+    boxes_abs = [[(o["bbox"]["x_center"] - o["bbox"]["width"] / 2) * W,
+                  (o["bbox"]["y_center"] - o["bbox"]["height"] / 2) * H,
+                  (o["bbox"]["x_center"] + o["bbox"]["width"] / 2) * W,
+                  (o["bbox"]["y_center"] + o["bbox"]["height"] / 2) * H] for o in objs]
+    inputs = sam_proc(image, input_boxes=[boxes_abs], return_tensors="pt").to(device)
+    with torch.no_grad():
+        out = sam(**inputs)
+    masks = sam_proc.image_processor.post_process_masks(
+        out.pred_masks.cpu(), inputs["original_sizes"].cpu(), inputs["reshaped_input_sizes"].cpu())[0]
+    scores = out.iou_scores.cpu()[0]   # (N, 3) — SAM emits 3 masks/box; pick the highest-IoU one
+    result = []
+    for n, o in enumerate(objs):
+        try:
+            best = int(scores[n].argmax())
+            m = masks[n, best].numpy().astype("uint8")
+            poly = _mask_to_polygon(m, W, H)
+        except Exception:
+            poly = None
+        result.append({**o, "polygon": poly} if poly else o)
+    return result
+
+
+# ── classification: CLIP zero-shot over the category names (the old server CLIP, on the GPU) ──
+_CLIP = {"pipe": None, "id": None}
+
+
+def _clip_classify(image_path, categories):
+    """Top-1 zero-shot classification of an image against the category names (CLIP). Returns a single
+    canonical object [{category, score}] — the backend stores it as {label}. Env ZEROSHOT_CLS_MODEL."""
+    import torch
+    from PIL import Image
+    from transformers import pipeline
+    model_id = os.environ.get("ZEROSHOT_CLS_MODEL", "openai/clip-vit-base-patch32")
+    if _CLIP["pipe"] is None or _CLIP["id"] != model_id:
+        _CLIP["pipe"] = pipeline("zero-shot-image-classification", model=model_id,
+                                 device=0 if torch.cuda.is_available() else -1)
+        _CLIP["id"] = model_id
+        print(f"[agent] zero-shot CLIP ready: {model_id}", flush=True)
+    out = _CLIP["pipe"](Image.open(image_path).convert("RGB"), candidate_labels=list(categories))
+    if not out:
+        return []
+    top = out[0]
+    return [{"category": top["label"], "score": float(top["score"])}]
+
+
+def run_zeroshot(task):
+    """Open-vocabulary zero-shot detection on the agent's GPU (GroundingDINO). No trained weights:
+    detect the project's category prompts in each image and return canonical objects — written back
+    as annotations by the backend (source='model', never clobbering manual work), like /auto-label."""
+    job_key = task["job_key"]
+    payload = task["payload"]
+    print(f"[agent] claimed {job_key}: zero-shot {payload.get('task')}", flush=True)
+
+    def post_progress(d):
+        try:
+            r = api("POST", f"/agent/tasks/{job_key}/progress", json=d)
+            return bool(r.get("cancel_requested"))
+        except Exception:
+            return False
+
+    tt = payload.get("task") or "detection"
+    is_cls = tt == "classification"
+    is_seg = tt in ("segmentation", "semantic")
+    post_progress({"stage": "Loading model", "progress": 3})
+    work = tempfile.mkdtemp(prefix=f"agent_zeroshot_{job_key}_")
+    try:
+        cats = payload.get("categories") or []
+        conf = float(payload.get("conf", 0.3))
+        text_th = float(payload.get("text_threshold", 0.25))
+        # Classification → CLIP over the category names (no boxes). Everything else → GroundingDINO
+        # boxes (+ SAM masks for segmentation). Load only what this task needs.
+        model = proc = device = sam = sam_proc = None
+        queries = []
+        if is_cls:
+            if not cats:
+                api("POST", f"/agent/tasks/{job_key}/result",
+                    json={"ok": False, "error": "no categories for zero-shot classification"})
+                return
+        else:
+            model, proc, device = _zeroshot_model()
+            # Prompts: category + optional per-category prompt override. GroundingDINO wants a lowercase
+            # phrase ending with " ." — one prompt per forward keeps each box's category unambiguous.
+            overrides = payload.get("prompts") or {}     # {category: "prompt override"}
+            for c in cats:
+                raw = (overrides.get(c) or c or "").strip()
+                if raw:
+                    queries.append((c, raw.lower().rstrip(".").strip() + " ."))
+            if not queries:
+                api("POST", f"/agent/tasks/{job_key}/result",
+                    json={"ok": False, "error": "no categories/prompts for zero-shot"})
+                return
+            if is_seg:
+                sam, sam_proc, _ = _sam_model()
+
+        cfg = api("GET", f"/agent/tasks/{job_key}/credentials").get("storage")
+        s3 = _s3_client(cfg) if cfg else None
+        prefix = (cfg.get("path_prefix").strip("/") + "/") if (cfg and cfg.get("path_prefix")) else ""
+        bucket = cfg.get("bucket") if cfg else None
+        unique = payload.get("project_unique_name") or f"project_{payload['project_id']}"
+
+        img_dir = os.path.join(work, "images")
+        os.makedirs(img_dir, exist_ok=True)
+        images = payload.get("images") or []
+        results, cancelled = [], False
+        for i, fn in enumerate(images):
+            # eval / combined datasets pass a full key '<unique>/images/<file>'; legacy = basename.
+            base = fn.replace("/", "_") if "/images/" in fn else os.path.basename(fn)
+            key = fn if "/images/" in fn else f"{unique}/images/{os.path.basename(fn)}"
+            local = os.path.join(img_dir, base)
+            if not os.path.exists(local):
+                if s3:
+                    try:
+                        s3.download_file(bucket, f"{prefix}{key}", local)
+                    except Exception as e:
+                        # Same S3-unreachable fallback as the training dataset build.
+                        if not download_media(key, local):
+                            print(f"[agent] zs skip {base}: {e}", flush=True)
+                            continue
+                elif not download_media(key, local):
+                    print(f"[agent] zs skip {base}: media fetch failed", flush=True)
+                    continue
+            if not os.path.exists(local):
+                continue
+            try:
+                if is_cls:
+                    objs = _clip_classify(local, cats)
+                else:
+                    objs = _zeroshot_detect(model, proc, device, local, queries, conf, text_th)
+                    if tt == "count":     # each box → a point at its centre (counting shape)
+                        objs = [{"category": o["category"], "score": o["score"],
+                                 "point": {"x": o["bbox"]["x_center"], "y": o["bbox"]["y_center"]}}
+                                for o in objs]
+                    elif tt == "obb":     # axis-aligned box → oriented box at angle 0 (annotator rotates)
+                        objs = [{"category": o["category"], "score": o["score"],
+                                 "obb": {"cx": o["bbox"]["x_center"], "cy": o["bbox"]["y_center"],
+                                         "w": o["bbox"]["width"], "h": o["bbox"]["height"], "angle": 0}}
+                                for o in objs]
+                    elif is_seg:          # box → SAM mask → polygon
+                        objs = _sam_segment(sam, sam_proc, device, local, objs)
+            except Exception as e:
+                print(f"[agent] zero-shot failed on {base}: {e}", flush=True)
+                objs = []
+            results.append({"file_path": fn, "objects": objs})
+            if post_progress({"stage": f"Zero-shot {i + 1}/{len(images)}",
+                              "progress": int(5 + 90 * (i + 1) / max(1, len(images)))}):
+                cancelled = True
+                break
+
+        api("POST", f"/agent/tasks/{job_key}/result", json={
+            "ok": True, "predictions": results, "count": len(results),
+            "cancelled": cancelled, "task": payload.get("task")})
+        print(f"[agent] {job_key} zero-shot done: {len(results)} image(s)", flush=True)
+    except Exception as e:
+        traceback.print_exc()
+        try:
+            api("POST", f"/agent/tasks/{job_key}/result", json={"ok": False, "error": str(e)[:500]})
+        except Exception:
+            pass
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
 def run_infer(task):
     """Run a trained permissive model on a set of images and return canonical objects per image.
     The model is located in the agent's local store (it trained it) or downloaded from the user's
     S3; images are pulled from the user's S3; backend.predict() yields the universal DB shape."""
     job_key = task["job_key"]
     payload = task["payload"]
+    # Open-vocabulary zero-shot (GroundingDINO) — no trained weights. Same JOB_TYPE_INFER queue /
+    # result path (predictions → annotations), but a different model, so it forks here.
+    if payload.get("zero_shot"):
+        return run_zeroshot(task)
     print(f"[agent] claimed {job_key}: infer {payload.get('task')}", flush=True)
 
     def post_progress(d):
