@@ -305,6 +305,14 @@ def run_task(task):
         shutil.rmtree(work, ignore_errors=True)
 
 
+# ───────────────────────── zero-shot (open-vocab) inference ─────────────────────────
+# The old backend ran GroundingDINO in-process (removed when the API went torch-free). We port that
+# server zero-shot onto the agent's GPU: same open-vocab detector, run on the user's GPU instead of
+# in the browser (WebGPU tiny model). Reuses the /auto-label result path — predictions → annotations.
+
+_ZS = {"model": None, "proc": None, "id": None, "device": "cpu"}
+
+
 def _zeroshot_model():
     """Load GroundingDINO once (HF transformers, on the GPU) and cache it. `base` by default — bigger
     and more accurate than the browser's `tiny`, affordable on the agent's GPU. Env ZEROSHOT_MODEL
